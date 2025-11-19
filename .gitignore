@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Checkpoints and model weights
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+
+# Datasets
+datasets/
+
+# Episodes (images extracted from TFRecords)
+bora_code/episodes/
+episodes/
+
+# Results/outputs
+results/
+*.npz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+*.tmp
+
+# VGGT specific outputs
+src/vggt/input_images_*/
+src/vggt/.gradio/
+
+# Keep bora_code but exclude episodes
+!bora_code/
+bora_code/episodes/
