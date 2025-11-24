@@ -67,7 +67,6 @@ class VGGTGaussians(L.LightningModule):
         print("Loading VGGT base model...")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"device: {device}")
-        
         self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
         self.vggt.requires_grad_(False)
         # TODO: eval mode needed?
@@ -87,13 +86,15 @@ class VGGTGaussians(L.LightningModule):
         # rotation = 4
         # color (SH) = 3
         # total = 14
-        # TODO: consider changing SH degree from 0 to 1 for view-dependent effects
+        sh_degree = config.sh_degree
+        self.sh_degree = sh_degree
+        gaussian_num_channels = 3 + 3 + 4 + 3 * sh_degree + 1        # TODO: consider changing SH degree from 0 to 1 for view-dependent effects
         #       degree 0 = 1 coeeficient per color (3 total)
         #       degree 1 = 4 coefficients per color (12 total)
         #       with degree 1 SH output dim becomes 23
         self.gaussian_dpt = DPTHead(
             dim_in=2 * embed_dim,
-            output_dim = 14,
+            output_dim = gaussian_num_channels,
             activation='linear',
             conf_activation='expp1'
         ).to(device)
@@ -126,7 +127,9 @@ class VGGTGaussians(L.LightningModule):
                 # print(f"patch start idx: {patch_start_idx}")
 
                 print("Making gaussian head predictions")
-                gaussian_params_preds, gaussian_conf_preds = self.gaussian_head(aggregated_tokens_list, views, patch_start_idx)
+                gaussian_params_preds, gaussian_conf_preds = self.gaussian_dpt(
+                    aggregated_tokens_list, views, patch_start_idx
+                )
                 gaussian_head_preds = {
                     'gaussian_params': gaussian_params_preds,
                     'gaussian_conf': gaussian_conf_preds
@@ -237,7 +240,9 @@ if __name__ == "__main__":
         view1_sorted_files = sorted([file for file in os.listdir(view1_dir) if file.endswith('.png')])
         view2_sorted_files = sorted([file for file in os.listdir(view2_dir) if file.endswith('.png')])
         
-        episode_preds_list = []
+        # Initialize lists to store predictions across an episode
+        episode_vggt_preds_list = []
+        episode_gaussian_preds_list = []
 
         # Loop over all image pairs step-by-step
         # TODO: try loading third image and/or changing target image
@@ -253,13 +258,19 @@ if __name__ == "__main__":
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):
                     # Predict attributes including cameras, depth maps, and point maps.
-                    frozen_preds, gaussian_preds = model(images)
+                    vggt_preds, gaussian_preds = model(images)
                     # print(f"gaussian preds: {gaussian_preds}")
 
+            print(f"len vggt preds items: {len(vggt_preds.items())}")
+            print(f"len gaussian preds items: {len(gaussian_preds.items())}")
+
             # Store the model outputs
-            frozen_preds_numpy = {k: v.detach().cpu().float().numpy() if torch.is_tensor(v) else v for k, v in frozen_preds.items()}
+            vggt_preds_numpy = {k: v.detach().cpu().float().numpy() if torch.is_tensor(v) else v for k, v in vggt_preds.items()}
             gaussian_preds_numpy = {k: v.detach().cpu().float().numpy() if torch.is_tensor(v) else v for k, v in gaussian_preds.items()}
-            episode_preds_list.append(frozen_preds_numpy | gaussian_preds_numpy)
+
+            # Append to the per-episode prediction lists
+            episode_vggt_preds_list.append(vggt_preds_numpy)
+            episode_gaussian_preds_list.append(gaussian_preds_numpy)
 
             print("Got outputs")
 
@@ -271,7 +282,7 @@ if __name__ == "__main__":
         bora_ssd_path = '/media/bora/Extreme Pro/new_proj/vggt_gaussians_outputs'
         os.makedirs(bora_ssd_path, exist_ok=True)
         output_path = os.path.join(bora_ssd_path, f'vggt_gaussians_outputs_{i:06d}.npz')
-        np.savez(output_path, pred1=episode_preds_list)
+        np.savez(output_path, vggt_preds=episode_vggt_preds_list, gaussian_preds=episode_gaussian_preds_list)
         print(f"Outputs saved to {output_path}: {os.path.exists(output_path)}")
 
 
