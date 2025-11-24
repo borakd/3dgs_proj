@@ -60,17 +60,32 @@ if __name__ == "__main__":
         data = np.load(file_path, allow_pickle=True)
         data_keys = list(data.keys())
         print(f"List of keys in data: {data_keys}")
-        predictions = [data[key] for key in data_keys]
-        for i, key in enumerate(data_keys):
-            print(f"key: {key}")
-            print(f"predictions[{i}].shape = {predictions[i].shape}")
+        # predictions = [data[key] for key in data_keys]
+        # for i, key in enumerate(data_keys):
+        #     print(f"key: {key}")
+        #     print(f"predictions[{i}].shape = {predictions[i].shape}")
+        vggt_preds = data['vggt_preds']
+        gaussian_preds = data['gaussian_preds']
 
         # Check which steps to process for the current episode
         episode_steps_to_process = steps_to_process
         if episode_steps_to_process is None:
-            num_steps = len(predictions[0])
+            num_steps = len(vggt_preds)
             episode_steps_to_process = sorted(set(np.linspace(0, num_steps - 1, 3, dtype=int).tolist()))
         print(f"episode_steps_to_process = {episode_steps_to_process}")
 
 
+        # For each step, check the predictions
+        for step_idx in episode_steps_to_process:
+            vggt_dict = vggt_preds[step_idx]
+            gaussian_dict = gaussian_preds[step_idx]
 
+            print("------------ VGGT PREDICTIONS ------------")
+            for key, value in vggt_dict.items():
+                print(f"vggt_dict[{key}] first 2 values: {vggt_dict[key][:2]}")
+                print()
+            
+            print("------------ GAUSSIAN PREDICTIONS ------------")
+            for key, value in gaussian_dict.items():
+                print(f"gaussian_dict[{key}] first 2 values: {gaussian_dict[key][:2]}")
+                print()
