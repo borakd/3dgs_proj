@@ -22,6 +22,8 @@ if __name__ == "__main__":
                     help='Episodes to process: zero-indexed single value (e.g., 0) or range (e.g., 1-5)')
     parser.add_argument('--do_steps', type=str, default=None,
                     help='Steps to process: zero-indexed single value (e.g., 0) or range (e.g., 1-5)')
+    parser.add_argument('--render_gaussians', action='store_true',
+                    help='Render Gaussians into 2D images (if supported by model)')
     args = parser.parse_args()
 
     # Parse do_episodes argument
@@ -208,6 +210,12 @@ if __name__ == "__main__":
             print(f"episode_steps_to_process = {episode_steps_to_process}")
 
             # Preds are extracted, now call the visualization helper
-            create_visualizations_splatt3r(preds, episode_idx, splatt3r_visuals_dir, episode_steps_to_process)
+            create_visualizations_splatt3r(
+                preds,
+                episode_idx,
+                splatt3r_visuals_dir,
+                episode_steps_to_process,
+                render_gaussians=args.render_gaussians
+            )
 
                 

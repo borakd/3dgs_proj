@@ -20,6 +20,8 @@ if __name__ == "__main__":
                     help='Episodes to process: zero-indexed single value (e.g., 0) or range (e.g., 1-5)')
     parser.add_argument('--do_steps', type=str, default=None,
                     help='Steps to process: zero-indexed single value (e.g., 0) or range (e.g., 1-5)')
+    parser.add_argument('--render_gaussians', action='store_true',
+                    help='Render Gaussians into 2D images (requires CUDA)')
     args = parser.parse_args()
 
     # Parse do_episodes argument
@@ -48,6 +50,13 @@ if __name__ == "__main__":
     vggt_gaussians_results_dir = os.path.join(results_base_dir, 'vggt_gaussians_outputs')
     vggt_gaussians_visuals_dir = os.path.join(results_base_dir, 'vggt_gaussians_visuals')
     print(f"Checking results in {vggt_gaussians_results_dir}")
+    
+    # Import visualization function (once, outside the loop)
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+    from visualization_utils import create_visualizations_vggt_gaussians
+    
+    # Create output directory
+    os.makedirs(vggt_gaussians_visuals_dir, exist_ok=True)
 
     # Loop over the .npz files in the results directory
     results_sorted_files = sorted([file for file in os.listdir(vggt_gaussians_results_dir) if file.endswith('.npz')])
@@ -77,15 +86,44 @@ if __name__ == "__main__":
 
         # For each step, check the predictions
         for step_idx in episode_steps_to_process:
+            print(f"Step {step_idx}:")
             vggt_dict = vggt_preds[step_idx]
             gaussian_dict = gaussian_preds[step_idx]
 
-            print("------------ VGGT PREDICTIONS ------------")
-            for key, value in vggt_dict.items():
-                print(f"vggt_dict[{key}] first 2 values: {vggt_dict[key][:2]}")
-                print()
+            # Unwrap object arrays if needed
+            if isinstance(vggt_dict, np.ndarray) and vggt_dict.dtype == object:
+                vggt_dict = vggt_dict.item()
+            if isinstance(gaussian_dict, np.ndarray) and gaussian_dict.dtype == object:
+                gaussian_dict = gaussian_dict.item()
+
+            # print("------------ VGGT PREDICTIONS ------------")
+            # for key, value in vggt_dict.items():
+            #     print(f"vggt_dict[{key}] first value: {vggt_dict[key][0]}")
+            #     print(f"vggt_dict[{key}] shape: {vggt_dict[key].shape}")
+            #     print()
             
             print("------------ GAUSSIAN PREDICTIONS ------------")
             for key, value in gaussian_dict.items():
-                print(f"gaussian_dict[{key}] first 2 values: {gaussian_dict[key][:2]}")
+                if value is None:
+                    print(f"gaussian_dict[{key}] is None")
+                    print()
+                    continue
+                arr = value
+                if isinstance(arr, np.ndarray):
+                    print(f"gaussian_dict[{key}] shape: {arr.shape}")
+                else:
+                    print(f"gaussian_dict[{key}] type: {type(arr)}")
                 print()
+            
+        print(f"All vggt_dict keys: {vggt_dict.keys()}")
+        print(f"All gaussian_dict keys: {gaussian_dict.keys()}")
+        
+        # Create visualizations for VGGT Gaussians (called once per episode, outside the step loop)
+        create_visualizations_vggt_gaussians(
+            vggt_preds,
+            gaussian_preds,
+            episode_idx,
+            vggt_gaussians_visuals_dir,
+            steps_to_process=episode_steps_to_process,
+            render_gaussians=args.render_gaussians
+        )

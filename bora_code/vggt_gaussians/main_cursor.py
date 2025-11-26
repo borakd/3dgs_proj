@@ -25,6 +25,7 @@ sys.path.append(os.path.join(project_root, 'src'))
 sys.path.append(os.path.join(project_root, 'src/vggt'))
 
 import utils.geometry
+import utils.sh_utils as sh_utils
 
 # Import Gaussian head from modified MASt3R implementation
 from mast3r.catmlp_dpt_head import (
@@ -66,7 +67,7 @@ class VGGTGaussians(L.LightningModule):
         self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
         self.vggt.requires_grad_(False)
         # TODO: eval mode needed?
-        # self.vggt.eval()
+        self.vggt.eval()
 
         # Debug print
         # print(f"Aggregator instance attributes: {vars(self.vggt.aggregator)}")
@@ -83,6 +84,7 @@ class VGGTGaussians(L.LightningModule):
         # Opacity (1)
         sh_degree = config.sh_degree
         gaussian_num_channels = 3 + 3 + 4 + 3 * sh_degree + 1
+        self.gaussian_num_channels = gaussian_num_channels  # Store for use in forward
         print(f"sh degree: {sh_degree}")
         print(f"gaussian num channels: {gaussian_num_channels}")
         #       degree 0 = 1 coeeficient per color (3 total)
@@ -95,6 +97,9 @@ class VGGTGaussians(L.LightningModule):
             conf_activation='expp1',
             feature_only=False
         ).to(device)
+        
+        # Freeze the Gaussian head as well (untrained, random initialization)
+        self.gaussian_dpt.requires_grad_(False)
 
         final_conv_layer = self.gaussian_dpt.scratch.output_conv2[-1]
         # print(f"final_conv_layer: {final_conv_layer}")
@@ -139,28 +144,191 @@ class VGGTGaussians(L.LightningModule):
         # vggt(views) tries to unpack 5 values but get 4, so add another dim
         if len(views.shape) == 4: views = views.unsqueeze(0)
 
+        B_imgs, S_imgs, _, H_img, W_img = views.shape
+
         with torch.no_grad():
             dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
             with torch.cuda.amp.autocast(dtype=dtype):
-                # print(f"views: {views}")
                 # Predict attributes including cameras, depth maps, and point maps.
                 print("Making frozen vggt predictions")
                 frozen_vggt_preds = self.vggt(views)
 
                 # Gaussian head is a DPT head and requires certain input tokens
                 aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(views)
-                # print(f"aggregated tokens list: {aggregated_tokens_list}")
-                # print(f"patch start idx: {patch_start_idx}")
 
                 print("Making gaussian head predictions")
                 gaussian_params_preds, _ = self.gaussian_dpt(
                     aggregated_tokens_list, views, patch_start_idx
                 )
-                gaussian_head_preds = {'gaussian_params': gaussian_params_preds}
-                # gaussian_head_preds = {
-                #     'gaussian_params': gaussian_params_preds,
-                #     'gaussian_conf': gaussian_conf_preds
-                # }
+                
+                # Get world_points early to use as reference for spatial dimensions
+                world_points = frozen_vggt_preds['world_points']
+                B_vggt, S_vggt, H_vggt, W_vggt, _ = world_points.shape
+                
+                # The DPT head returns preds with shape [B, S, C, H, W] or [B, S, H, W, C]
+                # Check the actual shape and handle accordingly
+                gaussian_num_channels = self.gaussian_num_channels
+                print(f"DEBUG: gaussian_params_preds shape: {gaussian_params_preds.shape}, expected channels: {gaussian_num_channels}")
+                print(f"DEBUG: world_points spatial dims: H={H_vggt}, W={W_vggt}")
+                
+                # Handle different possible shapes from DPT head
+                if len(gaussian_params_preds.shape) == 5:
+                    B, S, dim1, dim2, dim3 = gaussian_params_preds.shape
+                    print(f"DEBUG: dim1={dim1}, dim2={dim2}, dim3={dim3}")
+                    
+                    # Determine which dimension is channels vs spatial dimensions
+                    # Channels should be gaussian_num_channels (14), spatial dims should be similar (e.g., 518, 518)
+                    # If dim1 matches expected channels, shape is [B, S, C, H, W]
+                    if dim1 == gaussian_num_channels:
+                        # Shape is [B, S, C, H, W] - correct format
+                        C, H, W = dim1, dim2, dim3
+                        gaussian_params_flat = gaussian_params_preds.view(B * S, C, H, W)
+                    # If dim3 matches expected channels, shape is [B, S, H, W, C]
+                    elif dim3 == gaussian_num_channels:
+                        # Shape is [B, S, H, W, C] - need to permute
+                        H, W, C = dim1, dim2, dim3
+                        gaussian_params_flat = gaussian_params_preds.view(B * S, H, W, C).permute(0, 3, 1, 2)
+                    else:
+                        # Neither dim1 nor dim3 match expected channels
+                        # Check if dim1 is much larger (likely channels) and dim2, dim3 are similar (likely spatial)
+                        # or if dim3 is much larger (likely channels) and dim1, dim2 are similar (likely spatial)
+                        if dim1 > gaussian_num_channels and dim2 == dim3:
+                            # Shape is [B, S, C, H, W] where C > gaussian_num_channels and H == W
+                            # Take only the first gaussian_num_channels channels
+                            C = gaussian_num_channels
+                            H, W = dim2, dim3  # These are the spatial dimensions
+                            gaussian_params_flat = gaussian_params_preds[:, :, :gaussian_num_channels, :, :].view(B * S, C, H, W)
+                        elif dim3 > gaussian_num_channels and dim1 == dim2:
+                            # Shape is [B, S, H, W, C] where C > gaussian_num_channels and H == W
+                            H, W, C = dim1, dim2, gaussian_num_channels
+                            gaussian_params_flat = gaussian_params_preds[:, :, :, :, :gaussian_num_channels].view(B * S, H, W, C).permute(0, 3, 1, 2)
+                        elif dim1 > gaussian_num_channels:
+                            # Assume dim1 is channels, dim2 and dim3 are spatial (even if not equal)
+                            C = gaussian_num_channels
+                            H, W = dim2, dim3
+                            gaussian_params_flat = gaussian_params_preds[:, :, :gaussian_num_channels, :, :].view(B * S, C, H, W)
+                        elif dim3 > gaussian_num_channels:
+                            # Assume dim3 is channels, dim1 and dim2 are spatial
+                            H, W, C = dim1, dim2, gaussian_num_channels
+                            gaussian_params_flat = gaussian_params_preds[:, :, :, :, :gaussian_num_channels].view(B * S, H, W, C).permute(0, 3, 1, 2)
+                        else:
+                            raise ValueError(
+                                f"Unexpected tensor shape: {gaussian_params_preds.shape}. "
+                                f"Expected channels ({gaussian_num_channels}) in position 2 or 4, "
+                                f"but got dim1={dim1}, dim2={dim2}, dim3={dim3}"
+                            )
+                    
+                    print(f"DEBUG: After processing - C={C}, H={H}, W={W}, gaussian_params_flat shape: {gaussian_params_flat.shape}")
+                    
+                    # Validate that H and W are reasonable spatial dimensions (not channel counts)
+                    # H and W should be similar values (e.g., 518, 518) and not equal to the original channel count
+                    if H == gaussian_num_channels or W == gaussian_num_channels:
+                        raise ValueError(
+                            f"Shape inference error: H={H}, W={W} but one matches channel count {gaussian_num_channels}. "
+                            f"Original shape: {gaussian_params_preds.shape}. "
+                            f"This suggests channels and spatial dimensions are confused."
+                        )
+                    if abs(H - W) > 100:  # Spatial dimensions should be similar
+                        print(f"WARNING: H={H} and W={W} differ significantly. This might indicate a shape issue.")
+                else:
+                    raise ValueError(f"Unexpected number of dimensions: {len(gaussian_params_preds.shape)}")
+                
+                # Validate and correct H, W using world_points as reference BEFORE permuting and splitting
+                # If inferred H, W don't match world_points, use world_points as ground truth
+                H_old, W_old = H, W
+                if H != H_vggt or W != W_vggt:
+                    # Check if one of H, W matches world_points (suggesting a swap or misidentification)
+                    if (H == H_vggt and W != W_vggt) or (H == W_vggt and W == H_vggt) or (W == H_vggt and H != W_vggt):
+                        print(f"WARNING: Gaussian param spatial dims (H={H}, W={W}) don't match world_points ({H_vggt}, {W_vggt}). "
+                              f"One dimension matches, correcting to use world_points dimensions.")
+                        # Use world_points dimensions as reference
+                        H, W = H_vggt, W_vggt
+                        # Reshape gaussian_params_flat to match correct spatial dimensions
+                        if gaussian_params_flat.shape[2] != H or gaussian_params_flat.shape[3] != W:
+                            gaussian_params_flat = F.interpolate(
+                                gaussian_params_flat,  # [B*S, C, H_old, W_old]
+                                size=(H, W),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                    elif H != H_vggt and W != W_vggt:
+                        # Neither matches - interpolate to match world_points
+                        print(f"INFO: Interpolating Gaussian params from ({H}, {W}) to world_points ({H_vggt}, {W_vggt})")
+                        H, W = H_vggt, W_vggt
+                        if gaussian_params_flat.shape[2] != H or gaussian_params_flat.shape[3] != W:
+                            gaussian_params_flat = F.interpolate(
+                                gaussian_params_flat,  # [B*S, C, H_old, W_old]
+                                size=(H, W),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                
+                # Permute to [B*S, H, W, C] for splitting along channel dimension
+                fmap = gaussian_params_flat.permute(0, 2, 3, 1)  # [B*S, H, W, C]
+                
+                # Split into individual components
+                # Order: offsets (3), scales (3), rotations (4), sh (3*sh_degree), opacities (1)
+                splits = [3, 3, 4, 3 * self.sh_degree, 1]
+                offset, scales, rotations, sh, opacities = torch.split(fmap, splits, dim=-1)
+                
+                # Post-process each component (now with correct H, W)
+                offset = reg_dense_offsets(offset)
+                scales = reg_dense_scales(scales)
+                rotations = reg_dense_rotation(rotations)
+                sh = reg_dense_sh(sh)
+                opacities = reg_dense_opacities(opacities)
+                
+                # Reshape back to [B, S, H, W, ...] with correct H, W
+                offset = offset.view(B, S, H, W, 3)
+                scales = scales.view(B, S, H, W, 3)
+                rotations = rotations.view(B, S, H, W, 4)
+                sh = sh.view(B, S, H, W, 3, self.sh_degree)
+                opacities = opacities.view(B, S, H, W, 1)
+                
+                # world_points already has correct spatial dimensions, no need to interpolate
+                
+                # Compute means: either world_points + offset or just world_points
+                if self.use_offsets:
+                    means = world_points + offset
+                else:
+                    means = world_points
+
+                # Seed SH DC term with the input image colors for meaningful appearance
+                base_sh = sh_utils.RGB2SH(einops.rearrange(views, "b s c h w -> b s h w c")).to(sh.dtype)
+                sh[..., 0] = sh[..., 0] + base_sh
+
+                # Build covariances for downstream rendering compatibility
+                covariances = utils.geometry.build_covariance(scales, rotations)
+
+                # Recover camera intrinsics/extrinsics from the VGGT pose encoding
+                camera_extrinsics, camera_intrinsics = None, None
+                if "pose_enc" in frozen_vggt_preds:
+                    pose_enc = frozen_vggt_preds["pose_enc"]
+                    camera_extrinsics, camera_intrinsics = pose_encoding_to_extri_intri(
+                        pose_enc, image_size_hw=(H_img, W_img)
+                    )
+                    # Convert extrinsics [B, S, 3, 4] to homogeneous [B, S, 4, 4]
+                    if camera_extrinsics is not None:
+                        pad_row = torch.tensor(
+                            [0, 0, 0, 1],
+                            device=camera_extrinsics.device,
+                            dtype=camera_extrinsics.dtype,
+                        ).view(1, 1, 1, 4).expand(camera_extrinsics.shape[0], camera_extrinsics.shape[1], 1, 4)
+                        camera_extrinsics = torch.cat([camera_extrinsics, pad_row], dim=2)
+
+                # Build the Gaussian predictions dictionary
+                gaussian_head_preds = {
+                    'pts3d': world_points,
+                    'means': means,
+                    'scales': scales,
+                    'covariances': covariances,
+                    'rotations': rotations,
+                    'sh': sh,
+                    'opacities': opacities,
+                    'offsets': offset if self.use_offsets else None,
+                    'camera_extrinsics': camera_extrinsics,
+                    'camera_intrinsics': camera_intrinsics,
+                }
 
             return frozen_vggt_preds, gaussian_head_preds
 

@@ -1,5 +1,5 @@
 """
-Functions for visualizing the outputs stored in .npz files for MASt3R, VGGT, and Splatt3R
+Functions for visualizing the outputs stored in .npz files for MASt3R, VGGT, Splatt3R, and VGGT Gaussians
 """
 
 import numpy as np
@@ -11,11 +11,63 @@ from sklearn.decomposition import PCA
 import torch
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation
-import matplotlib.pyplot as plt
+try:
+    import einops
+except ImportError:
+    einops = None  # Optional import
 
-sys.path.append('..')
-from src.pixelsplat_src.cuda_splatting import render_cuda
-from utils.geometry import build_covariance
+# Add project root to path for imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+try:
+    from src.pixelsplat_src.cuda_splatting import render_cuda
+except ImportError:
+    render_cuda = None  # Optional import, may not be needed for all visualizations
+
+try:
+    from utils.geometry import build_covariance
+    from utils.geometry import normalize_intrinsics
+except ImportError:
+    # Fallback: define build_covariance if import fails (only needed for Splatt3R PLY export)
+    if einops is None:
+        # If einops is not available, build_covariance will fail when called
+        build_covariance = None
+        normalize_intrinsics = None
+    else:
+        def build_covariance(scale, rotation_xyzw):
+            '''Build the 3x3 covariance matrix from the three dimensional scale and the four dimension quaternion'''
+            scale = scale.diag_embed()
+            rotation = quaternion_to_matrix(rotation_xyzw)
+            return (
+                rotation
+                @ scale
+                @ einops.rearrange(scale, "... i j -> ... j i")
+                @ einops.rearrange(rotation, "... i j -> ... j i")
+            )
+        
+        def quaternion_to_matrix(quaternions, eps: float = 1e-8):
+            '''Convert the 4-dimensional quaternions to 3x3 rotation matrices.'''
+            i, j, k, r = torch.unbind(quaternions, dim=-1)
+            two_s = 2 / ((quaternions * quaternions).sum(dim=-1) + eps)
+            o = torch.stack(
+                (
+                    1 - two_s * (j * j + k * k),
+                    two_s * (i * j - k * r),
+                    two_s * (i * k + j * r),
+                    two_s * (i * j + k * r),
+                    1 - two_s * (i * i + k * k),
+                    two_s * (j * k - i * r),
+                    two_s * (i * k - j * r),
+                    two_s * (j * k + i * r),
+                    1 - two_s * (i * i + j * j),
+                ),
+                -1,
+            )
+            return einops.rearrange(o, "... (i j) -> ... i j", i=3, j=3)
+        
+        normalize_intrinsics = None
 
 # TODO: review this file and improve the quality of the visualiizations. All vibe coded at the moment
 
@@ -154,7 +206,7 @@ def create_visualizations_mast3r(pred, episode_idx, camera_name, step_idx, outpu
                 f.write("\n")
 
 
-def create_visualizations_splatt3r(preds, episode_idx, output_base_dir, steps_to_process=None):
+def create_visualizations_splatt3r(preds, episode_idx, output_base_dir, steps_to_process=None, render_gaussians=False):
     """
     Comprehensive visualization function for Splatt3R outputs.
     
@@ -163,6 +215,7 @@ def create_visualizations_splatt3r(preds, episode_idx, output_base_dir, steps_to
         episode_idx: Episode index
         output_base_dir: Base directory to save all visualizations
         steps_to_process: Optional set of step indices to process (None = process all)
+        render_gaussians: If True, render Gaussians into 2D images using CUDA splatting (requires GPU)
     """
     pred1_list, pred2_list = preds[0], preds[1]
     
@@ -200,6 +253,11 @@ def create_visualizations_splatt3r(preds, episode_idx, output_base_dir, steps_to
         # Create visualizations for each camera
         _visualize_single_prediction(pred1, episode_idx, 'exterior_image_1_left', step_idx, output_base_dir)
         _visualize_single_prediction(pred2, episode_idx, 'exterior_image_2_left', step_idx, output_base_dir)
+        
+        # Optional rendering of Gaussians into 2D images
+        if render_gaussians:
+            _render_splatt3r_single_step(pred1, episode_idx, step_idx, output_base_dir, view_name='view1')
+            _render_splatt3r_single_step(pred2, episode_idx, step_idx, output_base_dir, view_name='view2')
         
         # Save combined PLY file (combines both camera views)
         ply_output_dir = os.path.join(output_base_dir, f'episode_{episode_idx:06d}', 'combined_ply')
@@ -403,6 +461,103 @@ def _visualize_single_prediction(pred, episode_idx, camera_name, step_idx, outpu
                     f.write(f"  Mean: {arr.mean():.6f}\n")
                     f.write(f"  Std: {arr.std():.6f}\n")
                     f.write("\n")
+
+
+def _render_splatt3r_single_step(pred, episode_idx, step_idx, output_base_dir, view_name='view'):
+    """
+    Render Splatt3R Gaussians into 2D images using CUDA splatting (if available).
+    """
+    if render_cuda is None:
+        print("  WARNING: render_cuda not available; skipping Splatt3R Gaussian rendering.")
+        return
+    if normalize_intrinsics is None:
+        print("  WARNING: normalize_intrinsics not available; skipping Splatt3R Gaussian rendering.")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        print("  WARNING: CUDA device not available; skipping Splatt3R Gaussian rendering.")
+        return
+
+    def extract(pred_dict, key, alt_key=None):
+        k = key if key in pred_dict else alt_key
+        if k is None or k not in pred_dict:
+            return None
+        arr = pred_dict[k]
+        if isinstance(arr, np.ndarray) and arr.dtype == object:
+            arr = arr.item()
+        if isinstance(arr, np.ndarray):
+            arr = torch.from_numpy(arr)
+        if isinstance(arr, torch.Tensor) and arr.ndim > 3:
+            arr = arr[0]
+        return arr
+
+    means = extract(pred, 'means', 'means_in_other_view')
+    covariances = extract(pred, 'covariances')
+    if covariances is None:
+        scales = extract(pred, 'scales')
+        rotations = extract(pred, 'rotations')
+        if scales is None or rotations is None:
+            print("  WARNING: Missing scales/rotations for covariance; skipping Splatt3R rendering.")
+            return
+        if build_covariance is None:
+            print("  WARNING: build_covariance unavailable; skipping Splatt3R rendering.")
+            return
+        covariances = build_covariance(scales.unsqueeze(0), rotations.unsqueeze(0))[0]
+
+    sh = extract(pred, 'sh')
+    opacities = extract(pred, 'opacities')
+    if opacities is not None and opacities.ndim > 2:
+        opacities = opacities.squeeze(-1)
+
+    if any(x is None for x in [means, covariances, sh, opacities]):
+        print("  WARNING: Missing fields for Splatt3R rendering; skipping.")
+        return
+
+    H, W = means.shape[:2]
+    render_dir = os.path.join(output_base_dir, f'episode_{episode_idx:06d}', f'step_{step_idx:06d}', 'rendered_splatt3r')
+    os.makedirs(render_dir, exist_ok=True)
+
+    means_flat = means.reshape(-1, 3).to(device).float()
+    cov_flat = covariances.reshape(-1, 3, 3).to(device).float()
+    sh_flat = sh.reshape(-1, sh.shape[-2], sh.shape[-1]).to(device).float()
+    opa_flat = opacities.reshape(-1).to(device).float()
+
+    # Fallback camera: identity extrinsics, centered intrinsics
+    extr = torch.eye(4, device=device).unsqueeze(0).float()
+    intr = torch.zeros((1, 3, 3), device=device).float()
+    fx = fy = max(H, W) / 2.0
+    intr[..., 0, 0] = fx
+    intr[..., 1, 1] = fy
+    intr[..., 0, 2] = W / 2.0
+    intr[..., 1, 2] = H / 2.0
+    intr[..., 2, 2] = 1.0
+    intr = normalize_intrinsics(intr, (H, W))
+
+    bg = torch.tensor([1.0, 1.0, 1.0], device=device).unsqueeze(0)
+    with torch.no_grad():
+        color = render_cuda(
+            extr,
+            intr,
+            torch.full((1,), 0.1, device=device),
+            torch.full((1,), 1000.0, device=device),
+            (H, W),
+            bg,
+            means_flat.unsqueeze(0),
+            cov_flat.unsqueeze(0),
+            sh_flat.unsqueeze(0),
+            opa_flat.unsqueeze(0),
+        )
+    color = color[0].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(color)
+    plt.axis('off')
+    plt.tight_layout()
+    out_path = os.path.join(render_dir, f'{view_name}.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    print(f"  Rendered Splatt3R Gaussian {view_name} to {out_path}")
 
 
 def save_splatt3r_ply_from_npz(pred1, pred2, save_path):
@@ -817,3 +972,471 @@ def _visualize_vggt_single_step(pred, episode_idx, step_idx, output_base_dir):
                         f.write(f"  Std: {arr.std():.6f}\n")
                     f.write("\n")
 
+
+def create_visualizations_vggt_gaussians(vggt_preds_list, gaussian_preds_list, episode_idx, output_base_dir, steps_to_process=None, render_gaussians=False):
+    """
+    Comprehensive visualization function for VGGT Gaussians outputs.
+    Combines VGGT visualizations with Gaussian parameter visualizations and PLY export.
+    
+    Args:
+        vggt_preds_list: List of VGGT prediction dictionaries from npz file (one per step)
+        gaussian_preds_list: List of Gaussian prediction dictionaries from npz file (one per step)
+        episode_idx: Episode index
+        output_base_dir: Base directory to save all visualizations
+        steps_to_process: Optional set of step indices to process (None = process 3 evenly spaced)
+        render_gaussians: If True, render 2D images from Gaussians using CUDA splatting (requires GPU)
+    """
+    print(f"\nEpisode {episode_idx}:")
+    print(f"  Total steps: {len(vggt_preds_list)}")
+    if len(vggt_preds_list) > 0:
+        print(f"  Keys in vggt_preds_list[0]: {list(vggt_preds_list[0].keys())}")
+        print(f"  Keys in gaussian_preds_list[0]: {list(gaussian_preds_list[0].keys())}")
+    
+    # Determine which steps to process
+    if steps_to_process is None:
+        num_steps = len(vggt_preds_list)
+        steps_to_check = set(np.linspace(0, num_steps - 1, 3, dtype=int).tolist())
+    else:
+        steps_to_check = steps_to_process
+    
+    steps_to_check = sorted(steps_to_check) if isinstance(steps_to_check, set) else sorted(list(steps_to_check))
+    
+    for step_idx in steps_to_check:
+        if step_idx >= len(vggt_preds_list):
+            print(f"  Step {step_idx}: OUT OF RANGE")
+            continue
+        
+        vggt_pred = vggt_preds_list[step_idx]
+        gaussian_pred = gaussian_preds_list[step_idx]
+        
+        # Unwrap if needed
+        if isinstance(vggt_pred, np.ndarray) and vggt_pred.dtype == object:
+            vggt_pred = vggt_pred.item()
+        if isinstance(gaussian_pred, np.ndarray) and gaussian_pred.dtype == object:
+            gaussian_pred = gaussian_pred.item()
+        
+        if not isinstance(vggt_pred, dict) or not isinstance(gaussian_pred, dict):
+            print(f"  Step {step_idx}: Not a dict, skipping")
+            continue
+        
+        print(f"  Processing step {step_idx}...")
+        
+        # Visualize VGGT outputs
+        _visualize_vggt_single_step(vggt_pred, episode_idx, step_idx, output_base_dir)
+        
+        # Visualize Gaussian outputs
+        _visualize_vggt_gaussians_single_step(vggt_pred, gaussian_pred, episode_idx, step_idx, output_base_dir)
+        
+        # Optionally render Gaussians into 2D images
+        if render_gaussians:
+            _render_vggt_gaussians_single_step(gaussian_pred, episode_idx, step_idx, output_base_dir)
+        
+        # Save PLY file from Gaussian parameters
+        ply_output_dir = os.path.join(output_base_dir, f'episode_{episode_idx:06d}', 'combined_ply')
+        os.makedirs(ply_output_dir, exist_ok=True)
+        ply_path = os.path.join(ply_output_dir, f'step_{step_idx:06d}.ply')
+        save_vggt_gaussians_ply_from_npz(gaussian_pred, ply_path)
+    
+    print(f"  All visualizations saved to {output_base_dir}")
+
+
+def _visualize_vggt_gaussians_single_step(vggt_pred, gaussian_pred, episode_idx, step_idx, output_base_dir):
+    """Visualize Gaussian parameters for a single step"""
+    
+    # Create directory structure
+    step_dir = os.path.join(output_base_dir, f'episode_{episode_idx:06d}', f'step_{step_idx:06d}', 'gaussians')
+    os.makedirs(step_dir, exist_ok=True)
+    
+    # Extract Gaussian arrays (remove batch dimension if present)
+    # Shape is [B, S, H, W, ...] where S is sequence length (number of images)
+    def extract_array(pred, key):
+        """Extract array and remove batch dimension"""
+        if key not in pred:
+            return None
+        arr = pred[key]
+        if arr.ndim == 5:  # [B, S, H, W, ...]
+            arr = arr[0]  # Remove batch dim: [S, H, W, ...]
+        elif arr.ndim == 6:  # [B, S, H, W, ..., ...] (e.g., sh: [B, S, H, W, 3, sh_degree])
+            arr = arr[0]  # Remove batch dim: [S, H, W, ..., ...]
+        return arr
+    
+    means = extract_array(gaussian_pred, 'means')
+    scales = extract_array(gaussian_pred, 'scales')
+    rotations = extract_array(gaussian_pred, 'rotations')
+    sh = extract_array(gaussian_pred, 'sh')
+    opacities = extract_array(gaussian_pred, 'opacities')
+    pts3d = extract_array(gaussian_pred, 'pts3d')
+    offsets = extract_array(gaussian_pred, 'offsets')
+    
+    # Get sequence length
+    S = means.shape[0] if means is not None else 1
+    
+    # Visualize each image in the sequence
+    for img_idx in range(S):
+        img_dir = os.path.join(step_dir, f'image_{img_idx:02d}')
+        os.makedirs(img_dir, exist_ok=True)
+        
+        # 1. Gaussian means (3D centers)
+        if means is not None:
+            fig = plt.figure(figsize=(15, 5))
+            means_img = means[img_idx]  # [H, W, 3]
+            pts_flat = means_img.reshape(-1, 3)
+            
+            # Sample if too many points
+            if len(pts_flat) > 50000:
+                indices = np.random.choice(len(pts_flat), 50000, replace=False)
+                pts_flat = pts_flat[indices]
+            
+            # 3D scatter plot
+            ax1 = fig.add_subplot(131, projection='3d')
+            ax1.scatter(pts_flat[:, 0], pts_flat[:, 1], pts_flat[:, 2], s=0.1, alpha=0.5)
+            ax1.set_xlabel('X')
+            ax1.set_ylabel('Y')
+            ax1.set_zlabel('Z')
+            ax1.set_title(f'Gaussian Means 3D {img_idx}')
+            ax1.view_init(elev=20, azim=45)
+            
+            # XY projection
+            ax2 = fig.add_subplot(132)
+            ax2.scatter(pts_flat[:, 0], pts_flat[:, 1], s=0.1, alpha=0.5)
+            ax2.set_xlabel('X')
+            ax2.set_ylabel('Y')
+            ax2.set_title(f'Gaussian Means XY {img_idx}')
+            ax2.set_aspect('equal')
+            
+            # XZ projection
+            ax3 = fig.add_subplot(133)
+            ax3.scatter(pts_flat[:, 0], pts_flat[:, 2], s=0.1, alpha=0.5)
+            ax3.set_xlabel('X')
+            ax3.set_ylabel('Z')
+            ax3.set_title(f'Gaussian Means XZ {img_idx}')
+            ax3.set_aspect('equal')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'gaussian_means.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # 2. Scales visualization
+        if scales is not None:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            scales_img = scales[img_idx]  # [H, W, 3]
+            
+            for i, ax in enumerate(axes):
+                scale_comp = scales_img[:, :, i]
+                im = ax.imshow(scale_comp, cmap='viridis', interpolation='nearest')
+                ax.set_title(f'Scale Component {i} ({"XYZ"[i]})')
+                plt.colorbar(im, ax=ax)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'scales.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # 3. Opacities visualization
+        if opacities is not None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            opacities_img = opacities[img_idx]
+            if opacities_img.ndim == 3 and opacities_img.shape[-1] == 1:
+                opacities_img = opacities_img.squeeze(-1)  # [H, W]
+            
+            im = ax.imshow(opacities_img, cmap='hot', interpolation='nearest')
+            ax.set_title(f'Opacities {img_idx}')
+            plt.colorbar(im, ax=ax)
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'opacities.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # 4. Spherical Harmonics (RGB from first 3 components)
+        if sh is not None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            sh_img = sh[img_idx]  # Should be [H, W, 3, sh_degree] after extraction
+            
+            # Handle different possible shapes
+            if sh_img.ndim == 4:  # [H, W, 3, sh_degree]
+                # Extract first 3 components (RGB) from DC (index 0)
+                sh_rgb = sh_img[:, :, :, 0]  # [H, W, 3]
+            elif sh_img.ndim == 3:  # [H, W, 3] (already extracted)
+                sh_rgb = sh_img
+            else:
+                print(f"WARNING: Unexpected sh shape {sh_img.shape}, skipping visualization")
+                plt.close()
+                continue
+            
+            # Normalize to [0, 1] for display
+            sh_rgb = (sh_rgb - sh_rgb.min()) / (sh_rgb.max() - sh_rgb.min() + 1e-8)
+            sh_rgb = np.clip(sh_rgb, 0, 1)
+            
+            ax.imshow(sh_rgb)
+            ax.set_title(f'Spherical Harmonics RGB (DC) {img_idx}')
+            ax.axis('off')
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'spherical_harmonics_rgb.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # 5. Rotations visualization (quaternion magnitude)
+        if rotations is not None:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            rotations_img = rotations[img_idx]  # [H, W, 4]
+            
+            # Compute quaternion magnitude (should be ~1 for valid rotations)
+            rot_mag = np.linalg.norm(rotations_img, axis=-1)
+            
+            im = ax.imshow(rot_mag, cmap='viridis', interpolation='nearest')
+            ax.set_title(f'Rotation Quaternion Magnitude {img_idx}')
+            plt.colorbar(im, ax=ax)
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'rotations_magnitude.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+        
+        # 6. Offsets visualization (if available)
+        if offsets is not None:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            offsets_img = offsets[img_idx]  # [H, W, 3]
+            
+            for i, ax in enumerate(axes):
+                offset_comp = offsets_img[:, :, i]
+                # Use symmetric normalization around 0 for diverging colormap
+                vmax = max(abs(offset_comp.max()), abs(offset_comp.min()))
+                vmin = -vmax
+                im = ax.imshow(offset_comp, cmap='RdBu', interpolation='nearest', vmin=vmin, vmax=vmax)
+                ax.set_title(f'Offset Component {i} ({"XYZ"[i]})')
+                plt.colorbar(im, ax=ax)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(img_dir, 'offsets.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+
+
+def _render_vggt_gaussians_single_step(gaussian_pred, episode_idx, step_idx, output_base_dir, near=0.1, far=1000.0):
+    """
+    Render predicted Gaussians into 2D images using CUDA splatting (if available).
+    """
+    if render_cuda is None:
+        print("  WARNING: render_cuda not available; skipping Gaussian rendering.")
+        return
+    if normalize_intrinsics is None:
+        print("  WARNING: normalize_intrinsics not available; skipping Gaussian rendering.")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        print("  WARNING: CUDA device not available; skipping Gaussian rendering.")
+        return
+
+    def extract_array(pred, key):
+        if key not in pred:
+            return None
+        arr = pred[key]
+        if isinstance(arr, np.ndarray) and arr.dtype == object:
+            arr = arr.item()
+        if isinstance(arr, np.ndarray):
+            arr = torch.from_numpy(arr)
+        elif isinstance(arr, torch.Tensor):
+            arr = arr
+        else:
+            return None
+        if arr.ndim >= 1 and arr.shape[0] == 1:
+            arr = arr[0]
+        return arr
+
+    means = extract_array(gaussian_pred, "means")
+    covariances = extract_array(gaussian_pred, "covariances")
+    sh = extract_array(gaussian_pred, "sh")
+    opacities = extract_array(gaussian_pred, "opacities")
+    cam_extr = extract_array(gaussian_pred, "camera_extrinsics")
+    cam_intr = extract_array(gaussian_pred, "camera_intrinsics")
+
+    if any(x is None for x in [means, covariances, sh, opacities, cam_extr, cam_intr]):
+        print("  WARNING: Missing fields for rendering; skipping Gaussian rendering.")
+        return
+
+    S, H, W = means.shape[:3]
+    render_dir = os.path.join(output_base_dir, f'episode_{episode_idx:06d}', f'step_{step_idx:06d}', 'rendered')
+    os.makedirs(render_dir, exist_ok=True)
+
+    for img_idx in range(S):
+        means_view = means[img_idx].reshape(-1, 3).to(device).float()
+        cov_view = covariances[img_idx].reshape(-1, 3, 3).to(device).float()
+        sh_view = sh[img_idx].reshape(-1, sh.shape[-2], sh.shape[-1]).to(device).float()
+        op_view = opacities[img_idx].reshape(-1).to(device).float()
+
+        extr_view = cam_extr[img_idx].to(device).float()
+        intr_view = cam_intr[img_idx].to(device).float()
+        intr_view = normalize_intrinsics(intr_view[None, ...], (H, W))[0]
+
+        bg = torch.tensor([1.0, 1.0, 1.0], device=device).unsqueeze(0)
+        with torch.no_grad():
+            color = render_cuda(
+                extr_view.unsqueeze(0),
+                intr_view.unsqueeze(0),
+                torch.full((1,), near, device=device),
+                torch.full((1,), far, device=device),
+                (H, W),
+                bg,
+                means_view.unsqueeze(0),
+                cov_view.unsqueeze(0),
+                sh_view.unsqueeze(0),
+                op_view.unsqueeze(0),
+            )
+        color = color[0].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+
+        plt.figure(figsize=(8, 8))
+        plt.imshow(color)
+        plt.axis('off')
+        plt.tight_layout()
+        out_path = os.path.join(render_dir, f'view_{img_idx:02d}.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.close()
+        print(f"  Rendered Gaussian view {img_idx} to {out_path}")
+
+
+def save_vggt_gaussians_ply_from_npz(gaussian_pred, save_path):
+    """
+    Save VGGT Gaussians as PLY file from numpy predictions.
+    Works with outputs loaded from npz files.
+    Combines all images in the sequence into a single PLY file.
+    """
+    def extract_array(pred, key):
+        """Extract array from pred, handling batch dimensions"""
+        if key not in pred:
+            return None
+        
+        arr = pred[key]
+        # Remove batch dimension if present: [B, S, H, W, ...] -> [S, H, W, ...]
+        if arr.ndim == 5:
+            arr = arr[0]  # [S, H, W, ...]
+        elif arr.ndim == 6:  # [B, S, H, W, ..., ...] (e.g., sh: [B, S, H, W, 3, sh_degree])
+            arr = arr[0]  # [S, H, W, ..., ...]
+        return arr
+    
+    # Extract means
+    means = extract_array(gaussian_pred, 'means')
+    if means is None:
+        print(f"  WARNING: No means found in gaussian_pred, skipping PLY export")
+        return
+    
+    # Extract scales and rotations
+    scales = extract_array(gaussian_pred, 'scales')
+    rotations = extract_array(gaussian_pred, 'rotations')  # quaternions
+    
+    # Extract opacities
+    opacities = extract_array(gaussian_pred, 'opacities')
+    if opacities is not None and opacities.ndim > 2:
+        if opacities.shape[-1] == 1:
+            opacities = opacities.squeeze(-1)  # [S, H, W]
+    
+    # Extract spherical harmonics
+    sh = extract_array(gaussian_pred, 'sh')
+    if sh is not None and sh.ndim > 3:
+        # sh is [S, H, W, 3, sh_degree], extract first component (DC)
+        sh = sh[:, :, :, :, 0]  # [S, H, W, 3]
+    
+    # Get sequence length and spatial dimensions
+    S, H, W = means.shape[:3]
+    
+    # Combine all images in sequence
+    means_list = []
+    scales_list = []
+    rotations_list = []
+    sh_list = []
+    opacities_list = []
+    
+    for img_idx in range(S):
+        means_img = means[img_idx]  # [H, W, 3]
+        means_flat = means_img.reshape(-1, 3)  # (H*W, 3)
+        means_list.append(means_flat)
+        
+        if scales is not None:
+            scales_img = scales[img_idx]  # [H, W, 3]
+            scales_flat = scales_img.reshape(-1, 3)  # (H*W, 3)
+            scales_list.append(scales_flat)
+        
+        if rotations is not None:
+            rotations_img = rotations[img_idx]  # [H, W, 4]
+            rotations_flat = rotations_img.reshape(-1, 4)  # (H*W, 4)
+            rotations_list.append(rotations_flat)
+        
+        if sh is not None:
+            sh_img = sh[img_idx]  # [H, W, 3]
+            sh_flat = sh_img.reshape(-1, 3)  # (H*W, 3)
+            sh_list.append(sh_flat)
+        
+        if opacities is not None:
+            opacities_img = opacities[img_idx]  # [H, W]
+            opacities_flat = opacities_img.reshape(-1)  # (H*W,)
+            opacities_list.append(opacities_flat)
+    
+    # Concatenate all images
+    means_combined = np.concatenate(means_list, axis=0)  # (S*H*W, 3)
+    
+    if scales_list:
+        scales_combined = np.concatenate(scales_list, axis=0)  # (S*H*W, 3)
+    else:
+        scales_combined = np.ones((means_combined.shape[0], 3)) * 0.01  # Default small scale
+    
+    if rotations_list:
+        rotations_combined = np.concatenate(rotations_list, axis=0)  # (S*H*W, 4)
+    else:
+        # Default identity quaternion [0, 0, 0, 1]
+        rotations_combined = np.zeros((means_combined.shape[0], 4))
+        rotations_combined[:, 3] = 1.0
+    
+    if sh_list:
+        sh_combined = np.concatenate(sh_list, axis=0)  # (S*H*W, 3)
+    else:
+        sh_combined = np.ones((means_combined.shape[0], 3)) * 0.5  # Default gray
+    
+    if opacities_list:
+        opacities_combined = np.concatenate(opacities_list, axis=0)  # (S*H*W,)
+    else:
+        opacities_combined = np.ones(means_combined.shape[0]) * 0.5  # Default opacity
+    
+    # Normalize quaternions
+    quat_norms = np.linalg.norm(rotations_combined, axis=1, keepdims=True)
+    quat_norms = np.clip(quat_norms, 1e-8, None)
+    rotations_normalized = rotations_combined / quat_norms
+    
+    # Use first 3 components of SH as RGB (f_dc)
+    # Note: reg_dense_sh just reshapes, doesn't convert. SH coefficients are used directly
+    # matching Splatt3R's approach (they don't use SH2RGB conversion in PLY export)
+    sh_rgb = sh_combined[:, :3] if sh_combined.shape[1] >= 3 else sh_combined
+    
+    # Construct PLY attributes
+    num_gaussians = means_combined.shape[0]
+    rest_sh = np.zeros((num_gaussians, 0))  # No rest harmonics for now
+    normals = np.zeros((num_gaussians, 3))  # Placeholder normals
+    
+    # CRITICAL: reg_dense_scales returns scales.exp(), so scales are already in exponential space
+    # We need to take log to get back to log-space for PLY format (matching Splatt3R)
+    # But wait - let me check: in utils/export.py line 115, they do np.log(scales) where scales come from SVD
+    # In our case, scales come from reg_dense_scales which does .exp(), so we need .log() to undo it
+    # Actually, the PLY format expects log(scales), and our scales are already exp'd, so we log them
+    scales_log = np.log(np.clip(scales_combined, 1e-8, None))
+    
+    attributes = np.concatenate([
+        means_combined,           # x, y, z (3)
+        normals,                   # nx, ny, nz (3)
+        sh_rgb,                    # f_dc_0, f_dc_1, f_dc_2 (3)
+        rest_sh,                   # f_rest (0 for now)
+        opacities_combined[:, None],  # opacity (1)
+        scales_log,                # log(scale_0), log(scale_1), log(scale_2) (3)
+        rotations_normalized       # rot_0, rot_1, rot_2, rot_3 (4)
+    ], axis=1)
+    
+    # Define PLY format
+    dtype_full = [
+        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+        ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+        ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+        ('opacity', 'f4'),
+        ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
+        ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4')
+    ]
+    
+    elements = np.empty(num_gaussians, dtype=dtype_full)
+    elements[:] = list(map(tuple, attributes))
+    
+    # Save PLY file
+    point_cloud = PlyElement.describe(elements, "vertex")
+    scene = PlyData([point_cloud])
+    scene.write(save_path)
+    print(f"  Saved PLY file to {save_path} ({num_gaussians} Gaussians)")
