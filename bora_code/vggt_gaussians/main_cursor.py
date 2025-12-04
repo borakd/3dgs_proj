@@ -158,7 +158,9 @@ class VGGTGaussians(L.LightningModule):
 
                 print("Making gaussian head predictions")
                 gaussian_params_preds, _ = self.gaussian_dpt(
-                    aggregated_tokens_list, views, patch_start_idx
+                    aggregated_tokens_list,
+                    views,
+                    patch_start_idx
                 )
                 
                 # Get world_points early to use as reference for spatial dimensions
