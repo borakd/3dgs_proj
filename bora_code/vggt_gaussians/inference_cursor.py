@@ -8,6 +8,7 @@ import sys
 import torch
 import numpy as np
 import argparse
+import re
 import lightning as L
 
 # Add project root to path
@@ -26,7 +27,7 @@ def get_args_parser():
     parser.add_argument('--episodes_dir', type=str, default='bora_code/episodes',
                         help='Directory containing episode subdirectories')
     parser.add_argument('--output_dir', type=str, 
-                        default='/media/bora/Extreme Pro/new_proj/vggt_gaussians_outputs/inference',
+                        default='/media/bora/Extreme Pro/new_proj/vggt_gaussians_outputs/training',
                         help='Directory to save .npz output files')
     parser.add_argument('--do_episodes', type=str, default=None,
                         help='Episodes to process: single value (e.g., 0) or range (e.g., 1-5)')
@@ -83,6 +84,192 @@ def main():
     
     print(f"   ✓ Model loaded successfully")
     print(f"   ✓ Model on device: {args.device}")
+    
+    # ===== STRICT VERIFICATION: Ensure trained weights are actually loaded =====
+    print(f"\n   [VERIFICATION] Checking that trained weights were loaded...")
+    checkpoint_state = checkpoint.get('state_dict', checkpoint)
+    
+    # Check what Gaussian head parameters are in the checkpoint
+    gaussian_keys_in_ckpt = [k for k in checkpoint_state.keys() if 'gaussian_dpt' in k]
+    print(f"   [VERIFICATION] Gaussian head keys in checkpoint: {len(gaussian_keys_in_ckpt)}")
+    if len(gaussian_keys_in_ckpt) == 0:
+        raise RuntimeError("   ❌ ERROR: No Gaussian head weights found in checkpoint! Model may not have trained properly.")
+    
+    print(f"   [VERIFICATION] Sample checkpoint keys: {gaussian_keys_in_ckpt[:3]}...")
+    
+    # Check a sample weight value from checkpoint
+    sample_key = gaussian_keys_in_ckpt[0]
+    sample_weight_ckpt = checkpoint_state[sample_key]
+    if torch.is_tensor(sample_weight_ckpt):
+        print(f"   [VERIFICATION] Sample checkpoint weight shape: {sample_weight_ckpt.shape}")
+        print(f"   [VERIFICATION] Sample checkpoint weight - mean: {sample_weight_ckpt.float().mean().item():.6f}, std: {sample_weight_ckpt.float().std().item():.6f}")
+    
+    # Check what's actually in the loaded model
+    model_state_dict = model.state_dict()
+    model_gaussian_keys = [k for k in model_state_dict.keys() if 'gaussian_dpt' in k]
+    print(f"   [VERIFICATION] Gaussian head keys in loaded model: {len(model_gaussian_keys)}")
+    
+    if len(model_gaussian_keys) == 0:
+        raise RuntimeError("   ❌ ERROR: No Gaussian head found in loaded model!")
+    
+    # Verify weights match between checkpoint and loaded model
+    print(f"   [VERIFICATION] Verifying weights match checkpoint...")
+    matched_keys = 0
+    mismatched_keys = 0
+    missing_keys = []
+    
+    for key in gaussian_keys_in_ckpt:
+        if key in model_state_dict:
+            ckpt_val = checkpoint_state[key]
+            model_val = model_state_dict[key]
+            if torch.is_tensor(ckpt_val) and torch.is_tensor(model_val):
+                if torch.allclose(ckpt_val.float().cpu(), model_val.float().cpu(), atol=1e-4):
+                    matched_keys += 1
+                else:
+                    mismatched_keys += 1
+                    if mismatched_keys == 1:  # Print details for first mismatch
+                        print(f"   [VERIFICATION] ⚠ First mismatch at key: {key}")
+                        print(f"      Checkpoint mean: {ckpt_val.float().mean().item():.6f}, std: {ckpt_val.float().std().item():.6f}")
+                        print(f"      Model mean: {model_val.float().mean().item():.6f}, std: {model_val.float().std().item():.6f}")
+        else:
+            missing_keys.append(key)
+    
+    print(f"   [VERIFICATION] Weight matching: {matched_keys} matched, {mismatched_keys} mismatched, {len(missing_keys)} missing")
+    
+    if mismatched_keys > 0 or len(missing_keys) > 0:
+        print(f"   [VERIFICATION] ⚠ WARNING: Some weights don't match! This may indicate loading issues.")
+    
+    # Create a fresh untrained model to compare weights
+    print(f"   [VERIFICATION] Creating fresh untrained model for comparison...")
+    fresh_model = VGGTGaussians(config)
+    fresh_model = fresh_model.to(args.device)
+    fresh_model.eval()
+    fresh_state_dict = fresh_model.state_dict()
+    
+    # Compare sample weights between trained and untrained models
+    print(f"   [VERIFICATION] Comparing trained vs. untrained weights...")
+    sample_key = gaussian_keys_in_ckpt[0]
+    trained_val = None
+    untrained_val = None
+    weights_match_initialization = False
+    
+    if sample_key in model_state_dict and sample_key in fresh_state_dict:
+        trained_val = model_state_dict[sample_key].float()
+        untrained_val = fresh_state_dict[sample_key].float()
+        
+        if torch.allclose(trained_val, untrained_val, atol=1e-4):
+            weights_match_initialization = True
+            raise RuntimeError(
+                f"   ❌ ERROR: Trained model weights match untrained initialization!\n"
+                f"      This means the checkpoint weights were NOT loaded properly.\n"
+                f"      Sample key: {sample_key}\n"
+                f"      Both have mean: {trained_val.mean().item():.6f}, std: {trained_val.std().item():.6f}"
+            )
+        else:
+            print(f"   [VERIFICATION] ✓ Verified: Trained weights differ from initialization")
+            print(f"      Trained mean: {trained_val.mean().item():.6f}, std: {trained_val.std().item():.6f}")
+            print(f"      Untrained mean: {untrained_val.mean().item():.6f}, std: {untrained_val.std().item():.6f}")
+            print(f"      Difference (mean): {abs(trained_val.mean() - untrained_val.mean()).item():.6f}")
+    else:
+        print(f"   [VERIFICATION] ⚠ WARNING: Could not compare weights (sample key not found in both models)")
+    
+    # Check checkpoint metadata to verify training occurred
+    print(f"   [VERIFICATION] Checking checkpoint training metadata...")
+    if 'epoch' in checkpoint:
+        epoch = checkpoint['epoch']
+        print(f"   [VERIFICATION] Checkpoint epoch: {epoch}")
+        if epoch == 0:
+            print(f"   [VERIFICATION] ⚠ WARNING: Checkpoint is from epoch 0 - may not have trained")
+    else:
+        print(f"   [VERIFICATION] ⚠ WARNING: No epoch information in checkpoint")
+    
+    if 'global_step' in checkpoint:
+        step = checkpoint['global_step']
+        print(f"   [VERIFICATION] Checkpoint global_step: {step}")
+        if step == 0:
+            print(f"   [VERIFICATION] ⚠ WARNING: Checkpoint is from step 0 - may not have trained")
+    
+    # Check hyperparameters for training loss (if logged)
+    if 'hyper_parameters' in checkpoint:
+        hparams = checkpoint['hyper_parameters']
+        print(f"   [VERIFICATION] Hyperparameters found in checkpoint")
+        # Note: Training loss might be in checkpoint filename or logged separately
+    
+    # Extract training loss from checkpoint filename if available
+    checkpoint_name = os.path.basename(args.checkpoint)
+    loss_match = re.search(r'train_loss=([\d.]+)', checkpoint_name)
+    if loss_match:
+        train_loss = float(loss_match.group(1))
+        print(f"   [VERIFICATION] Training loss from filename: {train_loss:.6f}")
+        if train_loss == 0.0:
+            print(f"   [VERIFICATION] ⚠ WARNING: Training loss is 0.0 - this is suspicious!")
+            print(f"   [VERIFICATION] ⚠ This might indicate the loss wasn't logged properly or model didn't train")
+    
+    # Check for optimizer state (indicates training occurred)
+    if 'optimizer_states' in checkpoint or 'lr_schedulers' in checkpoint:
+        print(f"   [VERIFICATION] ✓ Optimizer/scheduler state found (training occurred)")
+    else:
+        print(f"   [VERIFICATION] ⚠ WARNING: No optimizer state found in checkpoint")
+    
+    # Check if weights match initialization pattern (would indicate untrained model)
+    print(f"   [VERIFICATION] Checking if weights match initialization pattern...")
+    final_conv_key = None
+    for key in gaussian_keys_in_ckpt:
+        if 'scratch.output_conv2' in key and 'weight' in key:
+            final_conv_key = key
+            break
+    
+    if final_conv_key and final_conv_key in model_state_dict:
+        final_conv_weight = model_state_dict[final_conv_key].float()
+        # Check bias initialization pattern (scales should have bias ~-7.0, opacity ~-2.0)
+        bias_key = final_conv_key.replace('.weight', '.bias')
+        if bias_key in model_state_dict:
+            final_conv_bias = model_state_dict[bias_key].float()
+            # Scales bias should be around -7.0 (channels 3-5), opacity should be around -2.0 (last channel)
+            scales_bias = final_conv_bias[3:6].mean().item()
+            opacity_bias = final_conv_bias[-1].item()
+            
+            print(f"   [VERIFICATION] Final conv layer - scales bias: {scales_bias:.6f} (expected ~-7.0), opacity bias: {opacity_bias:.6f} (expected ~-2.0)")
+            
+            # If biases match initialization exactly, weights might not be trained
+            if abs(scales_bias - (-7.0)) < 0.01 and abs(opacity_bias - (-2.0)) < 0.01:
+                print(f"   [VERIFICATION] ⚠ WARNING: Biases match initialization pattern exactly - weights may not be trained!")
+            else:
+                print(f"   [VERIFICATION] ✓ Biases differ from initialization (likely trained)")
+    
+    # Clean up fresh model to free memory
+    del fresh_model, fresh_state_dict
+    torch.cuda.empty_cache()
+    
+    # Final verification summary
+    print(f"   [VERIFICATION] ========== VERIFICATION SUMMARY ==========")
+    verification_passed = True
+    verification_warnings = []
+    
+    if len(gaussian_keys_in_ckpt) == 0:
+        verification_passed = False
+        verification_warnings.append("No Gaussian head weights in checkpoint")
+    
+    if mismatched_keys > len(gaussian_keys_in_ckpt) * 0.1:  # More than 10% mismatched
+        verification_passed = False
+        verification_warnings.append(f"Too many mismatched weights ({mismatched_keys}/{len(gaussian_keys_in_ckpt)})")
+    
+    if weights_match_initialization:
+        verification_passed = False
+        verification_warnings.append("Trained weights match untrained initialization")
+    
+    if trained_val is None or untrained_val is None:
+        verification_warnings.append("Could not compare trained vs. untrained weights")
+    
+    if verification_passed:
+        print(f"   [VERIFICATION] ✓ VERIFICATION PASSED: Trained weights confirmed loaded")
+    else:
+        print(f"   [VERIFICATION] ❌ VERIFICATION FAILED:")
+        for warning in verification_warnings:
+            print(f"      - {warning}")
+        raise RuntimeError("Verification failed: Trained weights may not be loaded correctly!")
+    print(f"   [VERIFICATION] ==========================================\n")
+    # ===== END VERIFICATION =====
     
     # Parse episodes to process
     episodes_to_process = None
