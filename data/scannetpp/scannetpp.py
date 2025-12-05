@@ -30,10 +30,16 @@ class ScanNetPPData():
 
         # Fetch the sequences to use
         if stage == "train":
-            sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_train.txt")
+            # Try new structure first, fallback to old structure for compatibility
+            sequence_file = os.path.join(self.root, "splits", "nvs_sem_train.txt")
+            if not os.path.exists(sequence_file):
+                sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_train.txt")
             bad_scenes = ['303745abc7']
         elif stage == "val" or stage == "test":
-            sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_val.txt")
+            # Try new structure first, fallback to old structure for compatibility
+            sequence_file = os.path.join(self.root, "splits", "nvs_sem_val.txt")
+            if not os.path.exists(sequence_file):
+                sequence_file = os.path.join(self.root, "raw", "splits", "nvs_sem_val.txt")
             bad_scenes = ['cc5237fd77']
         with open(sequence_file, "r") as f:
             self.sequences = f.read().splitlines()
@@ -53,21 +59,52 @@ class ScanNetPPData():
         scenes_with_no_good_frames = []
         for sequence in self.sequences:
 
+            # Try new structure first: {root}/data/{sequence}
+            # Fallback to old structure: {root}/raw/data/{sequence} and {root}/processed/{sequence}
+            input_data_folder = os.path.join(self.root, 'data', sequence)
             input_raw_folder = os.path.join(self.root, 'raw', 'data', sequence)
             input_processed_folder = os.path.join(self.root, 'processed', sequence)
+            
+            # Determine which structure to use
+            processed_base_folder = None
+            if os.path.exists(input_data_folder):
+                # New structure: everything is in {root}/data/{sequence}
+                base_folder = input_data_folder
+                processed_base_folder = input_data_folder  # Same folder for new structure
+            elif os.path.exists(input_raw_folder) and os.path.exists(input_processed_folder):
+                # Old structure: separate raw and processed folders
+                base_folder = input_raw_folder
+                processed_base_folder = input_processed_folder
+            else:
+                logger.warning(f"Could not find data folder for sequence {sequence}. Tried: {input_data_folder}, {input_raw_folder}")
+                scenes_with_no_good_frames.append(sequence)
+                continue
 
             # Load Train & Test Splits
-            frame_file = os.path.join(input_raw_folder, "dslr", "train_test_lists.json")
+            frame_file = os.path.join(base_folder, "dslr", "train_test_lists.json")
+            if not os.path.exists(frame_file):
+                logger.warning(f"Could not find train_test_lists.json for sequence {sequence} at {frame_file}")
+                scenes_with_no_good_frames.append(sequence)
+                continue
             with open(frame_file, "r") as f:
                 train_test_list = json.load(f)
 
-            # Camera Metadata
-            cams_metadata_path = f"{input_processed_folder}/dslr/nerfstudio/transforms_undistorted.json"
+            # Camera Metadata - use processed_base_folder (works for both structures)
+            cams_metadata_path = os.path.join(processed_base_folder, "dslr", "nerfstudio", "transforms_undistorted.json")
+            
+            if not os.path.exists(cams_metadata_path):
+                logger.warning(f"Could not find transforms_undistorted.json for sequence {sequence} at {cams_metadata_path}")
+                scenes_with_no_good_frames.append(sequence)
+                continue
             with open(cams_metadata_path, "r") as f:
                 cams_metadata = json.load(f)
 
             # Load the nerfstudio/transforms.json file to check whether each image is blurry
-            nerfstudio_transforms_path = f"{input_raw_folder}/dslr/nerfstudio/transforms.json"
+            nerfstudio_transforms_path = os.path.join(base_folder, "dslr", "nerfstudio", "transforms.json")
+            if not os.path.exists(nerfstudio_transforms_path):
+                logger.warning(f"Could not find transforms.json for sequence {sequence} at {nerfstudio_transforms_path}")
+                scenes_with_no_good_frames.append(sequence)
+                continue
             with open(nerfstudio_transforms_path, "r") as f:
                 nerfstudio_transforms = json.load(f)
 
@@ -84,12 +121,19 @@ class ScanNetPPData():
             sequence_color_paths = []
             sequence_depth_paths = []
             sequence_c2ws = []
+            
+            # Determine image and depth base paths - use processed_base_folder (works for both structures)
+            images_base = os.path.join(processed_base_folder, "dslr", "undistorted_images")
+            depths_base = os.path.join(processed_base_folder, "dslr", "undistorted_depths")
+            
             for train_file_name in train_test_list["train"]:
                 is_bad = file_path_to_nerfstudio_transform[train_file_name]["is_bad"]
                 if is_bad:
                     continue
-                sequence_color_paths.append(f"{input_processed_folder}/dslr/undistorted_images/{train_file_name}")
-                sequence_depth_paths.append(f"{input_processed_folder}/dslr/undistorted_depths/{train_file_name.replace('.JPG', '.png')}")
+                color_path = os.path.join(images_base, train_file_name)
+                depth_path = os.path.join(depths_base, train_file_name.replace('.JPG', '.png'))
+                sequence_color_paths.append(color_path)
+                sequence_depth_paths.append(depth_path)
                 frame_metadata = file_path_to_frame_metadata[train_file_name]
                 c2w = np.array(frame_metadata["transform_matrix"], dtype=np.float32)
                 c2w = P @ c2w @ P.T
@@ -157,10 +201,39 @@ def get_scannet_dataset(root, stage, resolution, num_epochs_per_epoch=1):
     data = ScanNetPPData(root, stage)
 
     coverage = {}
+    coverage_dir = './data/scannetpp/coverage'
+    
+    # Try to load coverage files, but make it optional
+    # If coverage files are missing, create a default structure that allows sampling to work
+    # (sampling will fall back to best views when overlaps are low)
     for sequence in data.sequences:
-        with open(f'./data/scannetpp/coverage/{sequence}.json', 'r') as f:
-            sequence_coverage = json.load(f)
-        coverage[sequence] = sequence_coverage[sequence]
+        coverage_file = os.path.join(coverage_dir, f'{sequence}.json')
+        if os.path.exists(coverage_file):
+            try:
+                with open(coverage_file, 'r') as f:
+                    sequence_coverage = json.load(f)
+                coverage[sequence] = sequence_coverage.get(sequence, {})
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Error loading coverage file {coverage_file}: {e}. Using default coverage structure.")
+                # Create default coverage structure: all overlaps = 0.5 (medium overlap)
+                # This allows sampling to work, though it won't be optimal
+                num_frames = len(data.color_paths[sequence])
+                coverage[sequence] = {
+                    i: {j: 0.5 for j in range(num_frames) if i != j}
+                    for i in range(num_frames)
+                }
+        else:
+            logger.info(f"Coverage file not found for sequence {sequence}: {coverage_file}. Using default coverage structure.")
+            # Create default coverage structure: all overlaps = 0.5 (medium overlap)
+            # This allows sampling to work, though it won't be optimal
+            num_frames = len(data.color_paths[sequence])
+            coverage[sequence] = {
+                i: {j: 0.5 for j in range(num_frames) if i != j}
+                for i in range(num_frames)
+            }
+    
+    if not os.path.exists(coverage_dir):
+        logger.info(f"Coverage directory not found: {coverage_dir}. Using default coverage structure for all sequences.")
 
     dataset = DUST3RSplattingDataset(
         data,
@@ -177,6 +250,35 @@ def get_scannet_test_dataset(root, alpha, beta, resolution, use_every_n_sample=1
     data = ScanNetPPData(root, 'val')
 
     samples_file = f'data/scannetpp/test_set_{alpha}_{beta}.json'
+    
+    # Check if test set file exists
+    if not os.path.exists(samples_file):
+        logger.warning(f"Test set file not found: {samples_file}")
+        logger.info("Falling back to using training dataset structure for validation (will sample views dynamically)")
+        # Fallback: use training dataset structure for validation
+        # This allows validation to work even without pre-computed test samples
+        coverage = {}
+        coverage_dir = './data/scannetpp/coverage'
+        
+        # Create default coverage structure (same as training dataset)
+        for sequence in data.sequences:
+            if sequence in data.color_paths:
+                num_frames = len(data.color_paths[sequence])
+                coverage[sequence] = {
+                    i: {j: 0.5 for j in range(num_frames) if i != j}
+                    for i in range(num_frames)
+                }
+        
+        # Use training dataset structure for validation
+        dataset = DUST3RSplattingDataset(
+            data,
+            coverage,
+            resolution,
+            num_epochs_per_epoch=1,  # Use fewer samples for validation
+        )
+        return dataset
+    
+    # If test set file exists, use it
     print(f"Loading samples from: {samples_file}")
     with open(samples_file, 'r') as f:
         samples = json.load(f)

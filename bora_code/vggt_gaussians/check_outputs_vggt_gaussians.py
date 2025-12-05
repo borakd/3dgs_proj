@@ -34,6 +34,8 @@ if __name__ == "__main__":
             episodes_to_process = set(map(int, args.do_episodes.split(',')))
         else:
             episodes_to_process = {int(args.do_episodes)}
+
+    print(f"episodes_to_process: {episodes_to_process}")
     
     # Parse do_steps argument
     steps_to_process = None
@@ -47,9 +49,12 @@ if __name__ == "__main__":
             steps_to_process = {int(args.do_steps)}
 
     # Open the directory containing the Splatt3R outputs
-    vggt_gaussians_results_dir = os.path.join(results_base_dir, 'vggt_gaussians_outputs')
-    vggt_gaussians_visuals_dir = os.path.join(results_base_dir, 'vggt_gaussians_visuals')
+    # vggt_gaussians_results_dir = os.path.join(results_base_dir, 'vggt_gaussians_outputs', 'inference')
+    # vggt_gaussians_visuals_dir = os.path.join(results_base_dir, 'vggt_gaussians_visuals', 'inference')
+    vggt_gaussians_results_dir = os.path.join(results_base_dir, 'vggt_gaussians_outputs', 'training')
+    vggt_gaussians_visuals_dir = os.path.join(results_base_dir, 'vggt_gaussians_visuals', 'training')
     print(f"Checking results in {vggt_gaussians_results_dir}")
+    # print(f"{os.listdir(vggt_gaussians_results_dir)}")
     
     # Import visualization function (once, outside the loop)
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -60,8 +65,12 @@ if __name__ == "__main__":
 
     # Loop over the .npz files in the results directory
     results_sorted_files = sorted([file for file in os.listdir(vggt_gaussians_results_dir) if file.endswith('.npz')])
-    for episode_idx, file in enumerate(results_sorted_files):
+    print(f"results_sorted_files: {results_sorted_files}")
+    # for episode_idx, file in enumerate(results_sorted_files):
+    for list_idx, file in enumerate(results_sorted_files):
+        episode_idx = int(file.split('_')[-1].split('.')[0])  # Extract episode number from filename
         if episodes_to_process is not None and episode_idx not in episodes_to_process:
+            # print(f"Skipping episode {episode_idx}")
             continue
         print(f"Episode {episode_idx}, {file} ------------------------------------------------")
         file_path = os.path.join(vggt_gaussians_results_dir, str(file))
@@ -95,6 +104,11 @@ if __name__ == "__main__":
                 vggt_dict = vggt_dict.item()
             if isinstance(gaussian_dict, np.ndarray) and gaussian_dict.dtype == object:
                 gaussian_dict = gaussian_dict.item()
+
+            if 'images' in vggt_dict:
+                print(f"VGGT images shape: {vggt_dict['images'].shape}")
+            if 'means' in gaussian_dict:
+                print(f"Gaussian means shape: {gaussian_dict['means'].shape}")
 
             # print("------------ VGGT PREDICTIONS ------------")
             # for key, value in vggt_dict.items():

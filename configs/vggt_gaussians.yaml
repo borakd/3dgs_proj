@@ -1,0 +1,44 @@
+name: '%Y-%m-%d-%H-%M-%S'
+
+# save_dir: './results/${name}/'
+save_dir: '/media/bora/Extreme Pro/new_proj'
+
+# Environment
+seed: 0
+devices: 'auto'
+
+# Loggers
+use_profiler: False
+loggers:
+  use_csv_logger: True
+  use_wandb: False  # Set to True if you want WandB logging (requires account setup)
+
+# Model
+# Note: VGGT loads from HuggingFace automatically, no pretrained_path needed
+use_pretrained: False  # VGGT loads from HuggingFace in __init__
+
+# Data
+data:
+  root: '/DATA/scannetpp_sample'  # Update this path to your ScanNet++ dataset location
+  batch_size: 1  # Start with 1, can increase if GPU memory allows
+  num_workers: 4
+  resolution: 518  # VGGT requires dimensions divisible by 14 (patch size)
+  epochs_per_train_epoch: 100  # How many times to sample from each scene each training epoch
+
+# Optimization
+opt:
+  epochs: 20
+  lr: 0.0001  # Learning rate for Gaussian head (VGGT backbone is frozen)
+  gradient_clip_val: 0.5
+
+# Loss
+loss:
+  mse_loss_weight: 1.0
+  lpips_loss_weight: 0.25
+  apply_mask: True
+  average_over_mask: True
+
+# Gaussian parameters
+use_offsets: True
+sh_degree: 1  # Spherical harmonics degree (0 or 1)
+
