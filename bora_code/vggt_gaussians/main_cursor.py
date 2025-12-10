@@ -140,7 +140,7 @@ class VGGTGaussians(L.LightningModule):
             activation='linear',
             conf_activation='expp1',
             feature_only=False
-        ).to(device)
+        )   # .to(device)
 
         final_conv_layer = self.gaussian_dpt.scratch.output_conv2[-1]
         # print(f"final_conv_layer: {final_conv_layer}")
