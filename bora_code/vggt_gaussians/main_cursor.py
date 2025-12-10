@@ -108,7 +108,7 @@ class VGGTGaussians(L.LightningModule):
         print("Loading VGGT base model...")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"device: {device}")
-        self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        self.vggt = VGGT.from_pretrained("facebook/VGGT-1B")    # removed ".to(device)", let Lightning handle it automatically for DDP
         self.vggt.requires_grad_(False)
         # TODO: eval mode needed?
         self.vggt.eval()
