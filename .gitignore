@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -13,29 +14,63 @@ build/
 venv/
 ENV/
 env/
+env.bak/
+venv.bak/
 
 # Checkpoints and model weights
 checkpoints/
+ckpt/
 *.ckpt
 *.pth
 *.pt
 
+# Model files (downloaded/generated)
+*.onnx
+skyseg.onnx
+
 # Datasets
 datasets/
-
-# Episodes (images extracted from TFRecords)
 bora_code/episodes/
 episodes/
 
 # Results/outputs
 results/
 *.npz
+*.ply
+
+# Lightning logs and outputs
+lightning_logs/
+*.csv  # Lightning CSV logs (if saved in repo)
+
+# WandB logs
+wandb/
+.wandb/
+
+# HuggingFace cache (VGGT loads from HuggingFace)
+.cache/
+.huggingface/
+~/.cache/huggingface/
+
+# Hydra outputs (from src/vggt)
+.hydra/
+output/
+
+# Coverage files (optional, but might be generated)
+data/scannetpp/coverage/
+*.coverage
+.coverage.*
+
+# Generated info files
+tfrecord_info.txt
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
 
 # OS
 .DS_Store
@@ -48,6 +83,9 @@ Thumbs.db
 # VGGT specific outputs
 src/vggt/input_images_*/
 src/vggt/.gradio/
+
+# Pixi environments (from src/vggt)
+.pixi
 
 # Keep bora_code but exclude episodes
 !bora_code/
